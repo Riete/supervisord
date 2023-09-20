@@ -81,15 +81,8 @@ func (r *RpcClient) initUnixSockRpcClient() error {
 		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 		return d.DialContext(ctx, "unix", r.unixSock.path)
 	}
-	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = dialer
 	var err error
 	// ignore this rpc address, only for url.Parse() and /RPC2 context
 	r.rpc, err = xmlrpc.NewClient("http://127.0.0.1/RPC2", tr)
