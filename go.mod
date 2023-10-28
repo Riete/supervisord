@@ -1,6 +1,6 @@
 module github.com/riete/supervisord
 
-go 1.21.0
+go 1.21
 
 require (
 	github.com/go-ini/ini v1.67.0
