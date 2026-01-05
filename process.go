@@ -3,23 +3,26 @@ package supervisord
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"os"
+	"strings"
 	"time"
 
 	"github.com/go-ini/ini"
+	"github.com/riete/convert/str"
 )
 
 const (
-	Stopped  = "STOPPED"
-	Starting = "STARTING"
-	Running  = "RUNNING"
-	Backoff  = "BACKOFF"
-	Stopping = "STOPPING"
-	Exited   = "EXITED"
-	Fatal    = "FATAL"
-	Unknown  = "UNKNOWN"
+	Stopped               = "STOPPED"
+	Starting              = "STARTING"
+	Running               = "RUNNING"
+	Backoff               = "BACKOFF"
+	Stopping              = "STOPPING"
+	Exited                = "EXITED"
+	Fatal                 = "FATAL"
+	Unknown               = "UNKNOWN"
+	defaultReadLogBufSize = 8 * 1024
 )
 
 type ProcessInfo struct {
@@ -61,7 +64,7 @@ type Process struct {
 	*RpcClient
 }
 
-func (p Process) Start(name string) error {
+func (p *Process) Start(name string) error {
 	status, err := p.Status(name)
 	if err != nil {
 		return err
@@ -72,7 +75,7 @@ func (p Process) Start(name string) error {
 	return nil
 }
 
-func (p Process) StartAll() (StartStopAllRet, bool, error) {
+func (p *Process) StartAll() (StartStopAllRet, bool, error) {
 	var ret StartStopAllRet
 	if err := p.rpc.Call("supervisor.startAllProcesses", nil, &ret); err != nil {
 		return ret, false, err
@@ -80,7 +83,7 @@ func (p Process) StartAll() (StartStopAllRet, bool, error) {
 	return ret, ret.IsAllSuccess(), nil
 }
 
-func (p Process) Stop(name string) error {
+func (p *Process) Stop(name string) error {
 	status, err := p.Status(name)
 	if err != nil {
 		return err
@@ -91,7 +94,7 @@ func (p Process) Stop(name string) error {
 	return nil
 }
 
-func (p Process) StopAll() (StartStopAllRet, bool, error) {
+func (p *Process) StopAll() (StartStopAllRet, bool, error) {
 	var ret StartStopAllRet
 	if err := p.rpc.Call("supervisor.stopAllProcesses", nil, &ret); err != nil {
 		return ret, false, err
@@ -99,14 +102,14 @@ func (p Process) StopAll() (StartStopAllRet, bool, error) {
 	return ret, ret.IsAllSuccess(), nil
 }
 
-func (p Process) Restart(name string) error {
+func (p *Process) Restart(name string) error {
 	if err := p.Stop(name); err != nil {
 		return err
 	}
 	return p.Start(name)
 }
 
-func (p Process) Status(name string) (string, error) {
+func (p *Process) Status(name string) (string, error) {
 	if ret, err := p.Info(name); err != nil {
 		return "", err
 	} else {
@@ -114,18 +117,18 @@ func (p Process) Status(name string) (string, error) {
 	}
 }
 
-func (p Process) Info(name string) (*ProcessInfo, error) {
+func (p *Process) Info(name string) (*ProcessInfo, error) {
 	var ret ProcessInfo
 	return &ret, p.rpc.Call("supervisor.getProcessInfo", name, &ret)
 }
 
-func (p Process) AllInfo() ([]ProcessInfo, error) {
+func (p *Process) AllInfo() ([]ProcessInfo, error) {
 	var ret []ProcessInfo
 	return ret, p.rpc.Call("supervisor.getAllProcessInfo", nil, &ret)
 }
 
 // Reread return [added] [changed] [removed]
-func (p Process) Reread() ([]string, []string, []string, error) {
+func (p *Process) Reread() ([]string, []string, []string, error) {
 	var ret [][][]string
 	if err := p.rpc.Call("supervisor.reloadConfig", nil, &ret); err != nil {
 		return nil, nil, nil, err
@@ -133,18 +136,18 @@ func (p Process) Reread() ([]string, []string, []string, error) {
 	return ret[0][0], ret[0][1], ret[0][2], nil
 }
 
-func (p Process) Add(name string) error {
+func (p *Process) Add(name string) error {
 	return p.rpc.Call("supervisor.addProcessGroup", name, nil)
 }
 
-func (p Process) Remove(name string) error {
+func (p *Process) Remove(name string) error {
 	if err := p.Stop(name); err != nil {
 		return err
 	}
 	return p.rpc.Call("supervisor.removeProcessGroup", name, nil)
 }
 
-func (p Process) Update() (map[string][]string, error) {
+func (p *Process) Update() (map[string][]string, error) {
 	m := make(map[string][]string)
 	added, changed, removed, err := p.Reread()
 	if err != nil {
@@ -168,7 +171,7 @@ func (p Process) Update() (map[string][]string, error) {
 	return m, nil
 }
 
-func (p Process) Options(name, configFile string) (map[string]string, error) {
+func (p *Process) Options(name, configFile string) (map[string]string, error) {
 	cfg, err := ini.LoadSources(ini.LoadOptions{AllowPythonMultilineValues: true}, configFile)
 	if err != nil {
 		return nil, err
@@ -181,21 +184,74 @@ func (p Process) Options(name, configFile string) (map[string]string, error) {
 	return m, nil
 }
 
-func (p Process) logTail(ctx context.Context, r io.ReadCloser, ch chan<- string) {
-	defer func() {
-		if err := recover(); err != nil {
-			ch <- fmt.Sprintf("%v", err)
+func (p *Process) tailLog(ctx context.Context, name, method string, readBufSize, tailLine int) io.ReadCloser {
+	if readBufSize == 0 {
+		readBufSize = defaultReadLogBufSize
+	}
+	r, w := io.Pipe()
+	go func() {
+		t := time.NewTicker(time.Second)
+		var offset int64
+		var err error
+		defer func() {
+			t.Stop()
+			if err == nil {
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				} else {
+					err = errors.New("tail log quit")
+				}
+			}
+			_ = w.CloseWithError(err)
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				var ret []any
+				if err = p.rpc.Call(method, []any{name, offset, readBufSize}, &ret); err != nil {
+					return
+				}
+				data, ok := ret[0].(string)
+				if !ok {
+					continue
+				}
+				// first read
+				if offset == 0 {
+					offset = ret[1].(int64)
+					lineCount := strings.Count(data, "\n")
+					if lineCount > tailLine {
+						data = strings.SplitAfterN(data, "\n", lineCount-tailLine+1)[lineCount-tailLine]
+					}
+				} else {
+					newOffset := ret[1].(int64)
+					if newOffset-offset > 0 {
+						dataOffset := len(data) - int(newOffset-offset)
+						offset = newOffset
+						data = data[dataOffset:]
+					}
+				}
+				if len(data) > 0 {
+					if _, err = w.Write(str.ToBytes(data)); err != nil {
+						return
+					}
+				}
+			}
 		}
-		close(ch)
-		r.Close()
 	}()
-	rb := bufio.NewReader(r)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			d, err := rb.ReadString('\n')
+	return r
+}
+
+func (p *Process) logChan(ctx context.Context, name, method string, readBufSize, tailLine int) chan string {
+	ch := make(chan string)
+	go func() {
+		defer close(ch)
+		r := p.tailLog(ctx, name, method, readBufSize, tailLine)
+		br := bufio.NewReader(r)
+		for {
+			line, err := br.ReadString('\n')
 			if err == io.EOF {
 				time.Sleep(time.Second)
 				continue
@@ -204,60 +260,18 @@ func (p Process) logTail(ctx context.Context, r io.ReadCloser, ch chan<- string)
 				ch <- err.Error()
 				return
 			}
-			ch <- d
+			ch <- line
 		}
-	}
+	}()
+	return ch
 }
 
-func (p Process) openLogFile(path string, offset int64) (io.ReadCloser, error) {
-	r, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	if offset < 0 {
-		offset = -offset
-	}
-	s, _ := os.Stat(path)
-	if s.Size() < offset {
-		offset = s.Size()
-	}
-	if _, err := r.Seek(-offset, io.SeekEnd); err != nil {
-		r.Close()
-		return nil, err
-	}
-	return r, nil
+func (p *Process) TailStdoutLog(ctx context.Context, name string, readBufSize, tailLine int) chan string {
+	return p.logChan(ctx, name, "supervisor.tailProcessStdoutLog", readBufSize, tailLine)
 }
 
-func (p Process) StdoutLog(ctx context.Context, name string, offset int64) (<-chan string, error) {
-	info, err := p.Info(name)
-	if err != nil {
-		return nil, err
-	}
-	r, err := p.openLogFile(info.StdoutLogFile, offset)
-	if err != nil {
-		return nil, err
-	}
-	ch := make(chan string)
-	go p.logTail(ctx, r, ch)
-	return ch, nil
-}
-
-func (p Process) StderrLog(ctx context.Context, name string, offset int64) (<-chan string, error) {
-	info, err := p.Info(name)
-	if err != nil {
-		return nil, err
-	}
-	path := info.StderrLogFile
-	if path == "" {
-		path = info.StdoutLogFile
-	}
-	r, err := p.openLogFile(path, offset)
-	if err != nil {
-		return nil, err
-	}
-	ch := make(chan string)
-	go p.logTail(ctx, r, ch)
-	return ch, nil
+func (p *Process) TailStderrLog(ctx context.Context, name string, readBufSize, tailLine int) chan string {
+	return p.logChan(ctx, name, "supervisor.tailProcessStderrLog", readBufSize, tailLine)
 }
 
 func NewProcessControl(client *RpcClient) *Process {
