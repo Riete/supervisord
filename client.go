@@ -113,6 +113,10 @@ func (r *RpcClient) initRpcClient() error {
 	return errors.New("init rpc client error: inet_http_server is disabled or find unix sock path failed")
 }
 
+func (r *RpcClient) Close() error {
+	return r.rpc.Close()
+}
+
 func NewRpcClient(option Option) (*RpcClient, error) {
 	r := &RpcClient{}
 	option(r)
