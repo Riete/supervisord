@@ -245,7 +245,7 @@ func (p *Process) tailLog(ctx context.Context, name, method string, readBufSize,
 }
 
 func (p *Process) logChan(ctx context.Context, name, method string, readBufSize, tailLine int) chan string {
-	ch := make(chan string)
+	ch := make(chan string, 64)
 	go func() {
 		defer close(ch)
 		r := p.tailLog(ctx, name, method, readBufSize, tailLine)
