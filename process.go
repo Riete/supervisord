@@ -227,10 +227,17 @@ func (p *Process) tailLog(ctx context.Context, name, method string, readBufSize,
 					}
 				} else {
 					newOffset := ret[1].(int64)
-					if newOffset-offset > 0 {
-						dataOffset := len(data) - int(newOffset-offset)
-						offset = newOffset
-						data = data[dataOffset:]
+					delta := newOffset - offset
+					if delta > 0 {
+						dataOffset := len(data) - int(delta)
+						//  overflowed, reset offset and newOffset
+						if dataOffset < 0 {
+							offset = 0
+							newOffset = 0
+						} else {
+							offset = newOffset
+							data = data[dataOffset:]
+						}
 					}
 				}
 				if len(data) > 0 {
